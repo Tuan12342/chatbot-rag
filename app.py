@@ -1,14 +1,18 @@
+import re
 from pathlib import Path
 
 import streamlit as st
 import pyarrow.parquet as pq
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
 from langchain_community.vectorstores.utils import DistanceStrategy
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import CrossEncoder
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,6 +20,7 @@ PAPERS_DIR = BASE_DIR / "papers"
 
 CHAT_MODEL = "qwen3:1.7b"
 EMBEDDING_MODEL = "qwen3-embedding:0.6b"
+RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
 SEPARATORS = [
     r"\n#{1,6}",
@@ -28,6 +33,10 @@ SEPARATORS = [
     " ",
     "",
 ]
+
+
+def preprocess_for_bm25(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower(), flags=re.UNICODE)
 
 
 class BatchedOllamaEmbeddings(Embeddings):
@@ -51,6 +60,33 @@ class BatchedOllamaEmbeddings(Embeddings):
         return self.embedding_model.embed_query(text)
 
 
+class Reranker:
+    def __init__(self, model_name: str):
+        self.model = CrossEncoder(
+            model_name,
+            max_length=512,
+            device="cpu",
+        )
+
+    def __call__(
+        self, query: str, documents: list[Document], top_k: int
+    ) -> list[Document]:
+        if not documents:
+            return []
+        pairs = [[query, document.page_content] for document in documents]
+        scores = self.model.predict(
+            pairs,
+            batch_size=1,
+            show_progress_bar=False,
+        )
+        ranked = sorted(
+            zip(scores, documents),
+            key=lambda item: float(item[0]),
+            reverse=True,
+        )
+        return [document for _, document in ranked[:top_k]]
+
+
 st.set_page_config(
     page_title="Chatbot RAG Local",
     page_icon="📚",
@@ -59,10 +95,14 @@ st.set_page_config(
 
 
 @st.cache_resource(show_spinner=False)
+def load_reranker(model_name: str):
+    return Reranker(model_name)
+
+
+@st.cache_resource(show_spinner=False)
 def build_rag_system(
     chat_model: str,
     embedding_model: str,
-    top_k: int,
     max_parquet_rows: int,
     document_version: tuple,
 ):
@@ -149,24 +189,38 @@ def build_rag_system(
         embedding=embeddings,
         distance_strategy=DistanceStrategy.COSINE,
     )
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": top_k},
-    )
     llm = ChatOllama(
         model=chat_model,
         temperature=0,
         num_ctx=4096,
-        num_predict=1000,
+        # -1: để Ollama tự sinh cho tới khi model phát tín hiệu kết thúc.
+        num_predict=-1,
     )
     return (
-        retriever,
+        vectorstore,
+        chunks,
         llm,
         len(source_files),
         len(documents),
         len(chunks),
         parquet_rows_loaded,
         parquet_rows_total,
+    )
+
+
+def make_hybrid_retriever(vectorstore, chunks, top_k: int):
+    vector_retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": top_k},
+    )
+    bm25_retriever = BM25Retriever.from_documents(
+        documents=chunks,
+        k=top_k,
+        preprocess_func=preprocess_for_bm25,
+    )
+    return EnsembleRetriever(
+        retrievers=[bm25_retriever, vector_retriever],
+        weights=[0.5, 0.5],
     )
 
 
@@ -244,9 +298,21 @@ with st.sidebar:
     st.header("Cấu hình")
     chat_model = st.text_input("Model trả lời", CHAT_MODEL)
     embedding_model = st.text_input("Model embedding", EMBEDDING_MODEL)
-    # Chỉ lấy đoạn có độ tương đồng cao nhất cho mỗi câu hỏi.
-    top_k = 1
-    st.caption("Số đoạn truy xuất (k): 1 — chỉ dùng nguồn phù hợp nhất")
+    st.text_input("Model reranker", RERANKER_MODEL, disabled=True)
+    candidate_k = st.slider(
+        "Số ứng viên mỗi nhánh",
+        min_value=1,
+        max_value=8,
+        value=4,
+        help="Mỗi nhánh BM25 và embedding lấy k đoạn, rồi gộp bằng Reciprocal Rank Fusion.",
+    )
+    final_top_k = st.slider(
+        "Số đoạn sau rerank (top-k)",
+        min_value=1,
+        max_value=4,
+        value=4,
+        help="Số nguồn tốt nhất được đưa vào prompt trả lời.",
+    )
     max_parquet_rows = st.number_input(
         "Số dòng Parquet tối đa (0 = tất cả)",
         min_value=0,
@@ -266,8 +332,8 @@ with st.sidebar:
     st.caption("Ứng dụng chạy local qua Ollama; không cần OpenAI API key.")
 
 
-st.title("📚 Chatbot RAG Local")
-st.caption("Hỏi đáp nội dung các tệp PDF trong thư mục papers")
+st.title("📚 Chatbot")
+
 
 source_files = sorted(
     list(PAPERS_DIR.glob("**/*.pdf")) + list(PAPERS_DIR.glob("**/*.parquet"))
@@ -278,9 +344,10 @@ document_version = tuple(
 )
 
 try:
-    with st.spinner("Đang đọc PDF và tạo chỉ mục lần đầu..."):
+    with st.spinner("Đang đọc file ..."):
         (
-            retriever,
+            vectorstore,
+            chunks,
             llm,
             file_count,
             document_count,
@@ -290,17 +357,18 @@ try:
         ) = build_rag_system(
             chat_model,
             embedding_model,
-            top_k,
             int(max_parquet_rows),
             document_version,
         )
+    retriever = make_hybrid_retriever(vectorstore, chunks, candidate_k)
 except Exception as error:
     st.error(f"Không thể khởi tạo chatbot: {error}")
     st.info(
         "Hãy kiểm tra Ollama đang chạy và đã tải đủ model:\n\n"
         "`ollama serve`\n\n"
         f"`ollama pull {chat_model}`\n\n"
-        f"`ollama pull {embedding_model}`"
+        f"`ollama pull {embedding_model}`\n\n"
+        f"Reranker `{RERANKER_MODEL}` cần Internet để tải từ Hugging Face ở lần đầu."
     )
     st.stop()
 
@@ -331,7 +399,17 @@ if question := st.chat_input("Nhập câu hỏi về tài liệu..."):
     with st.chat_message("assistant"):
         try:
             with st.spinner("Đang tìm trong tài liệu..."):
-                documents = retriever.invoke(question)
+                candidates = retriever.invoke(question)
+            with st.spinner("Đang tải/nạp reranker và xếp hạng các đoạn..."):
+                try:
+                    reranker = load_reranker(RERANKER_MODEL)
+                    documents = reranker(question, candidates, final_top_k)
+                except Exception as reranker_error:
+                    documents = candidates[:final_top_k]
+                    st.warning(
+                        "Reranker không chạy được; đang dùng thứ tự RRF. "
+                        f"Chi tiết: {reranker_error}"
+                    )
                 context, sources = format_context(documents)
 
             if not documents:
