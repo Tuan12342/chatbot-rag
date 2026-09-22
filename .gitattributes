@@ -1,0 +1,2 @@
+chatbot/indexes/pdf_knowledge/documents.jsonl filter=lfs diff=lfs merge=lfs -text
+chatbot/indexes/pdf_knowledge/index.faiss filter=lfs diff=lfs merge=lfs -text

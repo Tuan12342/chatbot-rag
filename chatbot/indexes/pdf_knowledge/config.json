@@ -1,0 +1,11 @@
+{
+  "embedding_model": "intfloat/multilingual-e5-base",
+  "embedding_dimension": 768,
+  "number_of_documents": 35263,
+  "normalize_embeddings": true,
+  "faiss_metric": "inner_product",
+  "document_prefix": "passage: ",
+  "query_prefix": "query: ",
+  "chunk_size": 1000,
+  "chunk_overlap": 200
+}
